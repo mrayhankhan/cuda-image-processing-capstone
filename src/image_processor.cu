@@ -1,14 +1,144 @@
 #include "image_processor.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include <opencv2/opencv.hpp>
 #include <iostream>
-#include <vector>
 #include <cmath>
 
-// CUDA kernel for Gaussian blur using separable convolution
-__global__ void gaussian_blur_kernel(float* input, float* output, int width, int height, 
-                                    int channels, float* kernel, int kernel_size) {
+// CUDA kernel for Gaussian blur
+__global__ void gaussian_blur_kernel(
+    unsigned char* input, 
+    unsigned char* output,
+    int width, 
+    int height, 
+    int channels,
+    float* kernel, 
+    int kernel_size) {
+    
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (x >= width || y >= height) return;
+    
+    int half_kernel = kernel_size / 2;
+    
+    for (int c = 0; c < channels; c++) {
+        float sum = 0.0f;
+        float weight_sum = 0.0f;
+        
+        for (int ky = -half_kernel; ky <= half_kernel; ky++) {
+            for (int kx = -half_kernel; kx <= half_kernel; kx++) {
+                int nx = x + kx;
+                int ny = y + ky;
+                
+                // Handle boundary conditions with clamping
+                nx = max(0, min(width - 1, nx));
+                ny = max(0, min(height - 1, ny));
+                
+                int input_idx = (ny * width + nx) * channels + c;
+                int kernel_idx = (ky + half_kernel) * kernel_size + (kx + half_kernel);
+                
+                float weight = kernel[kernel_idx];
+                sum += input[input_idx] * weight;
+                weight_sum += weight;
+            }
+        }
+        
+        int output_idx = (y * width + x) * channels + c;
+        output[output_idx] = (unsigned char)(sum / weight_sum);
+    }
+}
+
+// CUDA kernel for Sobel edge detection
+__global__ void sobel_edge_kernel(
+    unsigned char* input, 
+    unsigned char* output,
+    int width, 
+    int height, 
+    int channels) {
+    
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (x >= width || y >= height) return;
+    
+    // Sobel operators
+    const int sobel_x[9] = {-1, 0, 1, -2, 0, 2, -1, 0, 1};
+    const int sobel_y[9] = {-1, -2, -1, 0, 0, 0, 1, 2, 1};
+    
+    for (int c = 0; c < channels; c++) {
+        float gx = 0.0f, gy = 0.0f;
+        
+        for (int ky = -1; ky <= 1; ky++) {
+            for (int kx = -1; kx <= 1; kx++) {
+                int nx = max(0, min(width - 1, x + kx));
+                int ny = max(0, min(height - 1, y + ky));
+                
+                int input_idx = (ny * width + nx) * channels + c;
+                int kernel_idx = (ky + 1) * 3 + (kx + 1);
+                
+                float pixel_val = input[input_idx];
+                gx += pixel_val * sobel_x[kernel_idx];
+                gy += pixel_val * sobel_y[kernel_idx];
+            }
+        }
+        
+        float magnitude = sqrtf(gx * gx + gy * gy);
+        int output_idx = (y * width + x) * channels + c;
+        output[output_idx] = (unsigned char)min(255.0f, magnitude);
+    }
+}
+
+// CUDA kernel for emboss filter
+__global__ void emboss_kernel(
+    unsigned char* input, 
+    unsigned char* output,
+    int width, 
+    int height, 
+    int channels) {
+    
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (x >= width || y >= height) return;
+    
+    // Emboss kernel
+    const float emboss_kernel[9] = {
+        -2, -1,  0,
+        -1,  1,  1,
+         0,  1,  2
+    };
+    
+    for (int c = 0; c < channels; c++) {
+        float sum = 0.0f;
+        
+        for (int ky = -1; ky <= 1; ky++) {
+            for (int kx = -1; kx <= 1; kx++) {
+                int nx = max(0, min(width - 1, x + kx));
+                int ny = max(0, min(height - 1, y + ky));
+                
+                int input_idx = (ny * width + nx) * channels + c;
+                int kernel_idx = (ky + 1) * 3 + (kx + 1);
+                
+                sum += input[input_idx] * emboss_kernel[kernel_idx];
+            }
+        }
+        
+        // Add 128 for proper emboss effect and clamp to [0, 255]
+        int output_idx = (y * width + x) * channels + c;
+        output[output_idx] = (unsigned char)max(0.0f, min(255.0f, sum + 128.0f));
+    }
+}
+
+// CUDA kernel for custom convolution
+__global__ void convolution_kernel(
+    unsigned char* input, 
+    unsigned char* output,
+    int width, 
+    int height, 
+    int channels,
+    float* kernel, 
+    int kernel_size) {
+    
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     
@@ -19,276 +149,365 @@ __global__ void gaussian_blur_kernel(float* input, float* output, int width, int
     for (int c = 0; c < channels; c++) {
         float sum = 0.0f;
         
-        // Horizontal convolution
-        for (int k = -half_kernel; k <= half_kernel; k++) {
-            int sample_x = min(max(x + k, 0), width - 1);
-            int idx = (y * width + sample_x) * channels + c;
-            sum += input[idx] * kernel[k + half_kernel];
+        for (int ky = -half_kernel; ky <= half_kernel; ky++) {
+            for (int kx = -half_kernel; kx <= half_kernel; kx++) {
+                int nx = max(0, min(width - 1, x + kx));
+                int ny = max(0, min(height - 1, y + ky));
+                
+                int input_idx = (ny * width + nx) * channels + c;
+                int kernel_idx = (ky + half_kernel) * kernel_size + (kx + half_kernel);
+                
+                sum += input[input_idx] * kernel[kernel_idx];
+            }
         }
         
         int output_idx = (y * width + x) * channels + c;
-        output[output_idx] = sum;
+        output[output_idx] = (unsigned char)max(0.0f, min(255.0f, sum));
     }
 }
 
-// CUDA kernel for Sobel edge detection
-__global__ void sobel_edge_kernel(float* input, float* output, int width, int height, int channels) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    
-    if (x >= width || y >= height || x == 0 || y == 0 || x == width-1 || y == height-1) {
-        if (x < width && y < height) {
-            for (int c = 0; c < channels; c++) {
-                output[(y * width + x) * channels + c] = 0.0f;
-            }
-        }
-        return;
-    }
-    
-    // Sobel X kernel: [-1, 0, 1; -2, 0, 2; -1, 0, 1]
-    // Sobel Y kernel: [-1, -2, -1; 0, 0, 0; 1, 2, 1]
-    
-    for (int c = 0; c < channels; c++) {
-        float gx = 0.0f, gy = 0.0f;
-        
-        // Calculate gradients
-        gx += -1.0f * input[((y-1) * width + (x-1)) * channels + c];
-        gx += -2.0f * input[((y) * width + (x-1)) * channels + c];
-        gx += -1.0f * input[((y+1) * width + (x-1)) * channels + c];
-        gx += 1.0f * input[((y-1) * width + (x+1)) * channels + c];
-        gx += 2.0f * input[((y) * width + (x+1)) * channels + c];
-        gx += 1.0f * input[((y+1) * width + (x+1)) * channels + c];
-        
-        gy += -1.0f * input[((y-1) * width + (x-1)) * channels + c];
-        gy += -2.0f * input[((y-1) * width + (x)) * channels + c];
-        gy += -1.0f * input[((y-1) * width + (x+1)) * channels + c];
-        gy += 1.0f * input[((y+1) * width + (x-1)) * channels + c];
-        gy += 2.0f * input[((y+1) * width + (x)) * channels + c];
-        gy += 1.0f * input[((y+1) * width + (x+1)) * channels + c];
-        
-        float magnitude = sqrtf(gx * gx + gy * gy);
-        magnitude = fminf(magnitude, 255.0f);
-        
-        output[(y * width + x) * channels + c] = magnitude;
-    }
-}
+// Host function implementations
+extern "C" {
 
-// CUDA kernel for brightness and contrast adjustment
-__global__ void brightness_contrast_kernel(float* input, float* output, int width, int height, 
-                                          int channels, float brightness, float contrast) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+void launch_gaussian_blur_kernel(
+    unsigned char* d_input, 
+    unsigned char* d_output,
+    int width, 
+    int height, 
+    int channels,
+    float* d_kernel, 
+    int kernel_size, 
+    float sigma,
+    TimingInfo* timing) {
     
-    if (x >= width || y >= height) return;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
     
-    int idx = (y * width + x) * channels;
-    
-    for (int c = 0; c < channels; c++) {
-        float pixel = input[idx + c];
-        pixel = pixel * contrast + brightness;
-        pixel = fmaxf(0.0f, fminf(255.0f, pixel));
-        output[idx + c] = pixel;
-    }
-}
-
-// Host functions to launch kernels
-extern "C" void launch_gaussian_blur_kernel(float* input, float* output, int width, int height, 
-                                           int channels, float* kernel, int kernel_size, 
-                                           cudaStream_t stream) {
+    // Calculate grid and block dimensions
     dim3 block_size(16, 16);
-    dim3 grid_size((width + block_size.x - 1) / block_size.x, 
+    dim3 grid_size((width + block_size.x - 1) / block_size.x,
                    (height + block_size.y - 1) / block_size.y);
     
-    gaussian_blur_kernel<<<grid_size, block_size, 0, stream>>>(
-        input, output, width, height, channels, kernel, kernel_size);
+    cudaEventRecord(start);
+    
+    // Launch kernel
+    gaussian_blur_kernel<<<grid_size, block_size>>>(
+        d_input, d_output, width, height, channels, d_kernel, kernel_size);
+    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    
+    if (timing) {
+        cudaEventElapsedTime(&timing->kernel_time, start, stop);
+        timing->total_time = timing->kernel_time;
+    }
+    
+    CUDA_CHECK(cudaGetLastError());
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }
 
-extern "C" void launch_sobel_edge_kernel(float* input, float* output, int width, int height, 
-                                        int channels, cudaStream_t stream) {
+void launch_sobel_edge_kernel(
+    unsigned char* d_input, 
+    unsigned char* d_output,
+    int width, 
+    int height, 
+    int channels,
+    TimingInfo* timing) {
+    
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
     dim3 block_size(16, 16);
-    dim3 grid_size((width + block_size.x - 1) / block_size.x, 
+    dim3 grid_size((width + block_size.x - 1) / block_size.x,
                    (height + block_size.y - 1) / block_size.y);
     
-    sobel_edge_kernel<<<grid_size, block_size, 0, stream>>>(
-        input, output, width, height, channels);
+    cudaEventRecord(start);
+    
+    sobel_edge_kernel<<<grid_size, block_size>>>(
+        d_input, d_output, width, height, channels);
+    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    
+    if (timing) {
+        cudaEventElapsedTime(&timing->kernel_time, start, stop);
+        timing->total_time = timing->kernel_time;
+    }
+    
+    CUDA_CHECK(cudaGetLastError());
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }
 
-extern "C" void launch_brightness_contrast_kernel(float* input, float* output, int width, int height, 
-                                                 int channels, float brightness, float contrast, 
-                                                 cudaStream_t stream) {
+void launch_emboss_kernel(
+    unsigned char* d_input, 
+    unsigned char* d_output,
+    int width, 
+    int height, 
+    int channels,
+    TimingInfo* timing) {
+    
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
     dim3 block_size(16, 16);
-    dim3 grid_size((width + block_size.x - 1) / block_size.x, 
+    dim3 grid_size((width + block_size.x - 1) / block_size.x,
                    (height + block_size.y - 1) / block_size.y);
     
-    brightness_contrast_kernel<<<grid_size, block_size, 0, stream>>>(
-        input, output, width, height, channels, brightness, contrast);
-}
-
-// GPU memory management functions
-void allocate_gpu_memory(ImageData* gpu_images, const std::vector<cv::Mat>& cpu_images, int batch_size) {
-    for (int i = 0; i < batch_size && i < cpu_images.size(); i++) {
-        const cv::Mat& img = cpu_images[i];
-        size_t img_size = img.total() * img.elemSize();
-        
-        gpu_images[i].width = img.cols;
-        gpu_images[i].height = img.rows;
-        gpu_images[i].channels = img.channels();
-        
-        CUDA_CHECK(cudaMalloc(&gpu_images[i].data, img_size));
-    }
-}
-
-void free_gpu_memory(ImageData* gpu_images, int batch_size) {
-    for (int i = 0; i < batch_size; i++) {
-        if (gpu_images[i].data) {
-            CUDA_CHECK(cudaFree(gpu_images[i].data));
-            gpu_images[i].data = nullptr;
-        }
-    }
-}
-
-// Main image processing function
-std::vector<cv::Mat> process_images_gpu(const std::vector<cv::Mat>& images, 
-                                       const ProcessingParams& params) {
-    std::vector<cv::Mat> processed_images;
-    processed_images.reserve(images.size());
+    cudaEventRecord(start);
     
-    // Create CUDA streams for asynchronous processing
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    emboss_kernel<<<grid_size, block_size>>>(
+        d_input, d_output, width, height, channels);
     
-    // Process images in batches
-    int num_batches = (images.size() + params.batch_size - 1) / params.batch_size;
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
     
-    for (int batch = 0; batch < num_batches; batch++) {
-        int batch_start = batch * params.batch_size;
-        int current_batch_size = std::min(params.batch_size, 
-                                         static_cast<int>(images.size()) - batch_start);
-        
-        std::cout << "Processing batch " << (batch + 1) << "/" << num_batches 
-                  << " (" << current_batch_size << " images)" << std::endl;
-        
-        // Allocate GPU memory for current batch
-        ImageData* gpu_input = new ImageData[current_batch_size];
-        ImageData* gpu_output = new ImageData[current_batch_size];
-        
-        // Process each image in the batch
-        for (int i = 0; i < current_batch_size; i++) {
-            const cv::Mat& input_img = images[batch_start + i];
-            
-            // Convert image to float and normalize
-            cv::Mat float_img;
-            input_img.convertTo(float_img, CV_32F);
-            
-            // Allocate GPU memory
-            size_t img_size = float_img.total() * float_img.elemSize();
-            
-            gpu_input[i].width = float_img.cols;
-            gpu_input[i].height = float_img.rows;
-            gpu_input[i].channels = float_img.channels();
-            
-            CUDA_CHECK(cudaMalloc(&gpu_input[i].data, img_size));
-            CUDA_CHECK(cudaMalloc(&gpu_output[i].data, img_size));
-            
-            // Copy image to GPU
-            CUDA_CHECK(cudaMemcpyAsync(gpu_input[i].data, float_img.ptr<float>(), 
-                                     img_size, cudaMemcpyHostToDevice, stream));
-        }
-        
-        // Apply the specified filter
-        for (int i = 0; i < current_batch_size; i++) {
-            if (params.filter_type == "gaussian") {
-                // Create Gaussian kernel
-                float* d_kernel;
-                float* h_kernel = create_gaussian_kernel(params.kernel_size, 
-                                                       params.kernel_size / 6.0f);
-                size_t kernel_size_bytes = params.kernel_size * sizeof(float);
-                
-                CUDA_CHECK(cudaMalloc(&d_kernel, kernel_size_bytes));
-                CUDA_CHECK(cudaMemcpyAsync(d_kernel, h_kernel, kernel_size_bytes, 
-                                         cudaMemcpyHostToDevice, stream));
-                
-                launch_gaussian_blur_kernel((float*)gpu_input[i].data, (float*)gpu_output[i].data,
-                                          gpu_input[i].width, gpu_input[i].height, 
-                                          gpu_input[i].channels, d_kernel, 
-                                          params.kernel_size, stream);
-                
-                CUDA_CHECK(cudaFree(d_kernel));
-                delete[] h_kernel;
-            }
-            else if (params.filter_type == "sobel") {
-                launch_sobel_edge_kernel((float*)gpu_input[i].data, (float*)gpu_output[i].data,
-                                       gpu_input[i].width, gpu_input[i].height, 
-                                       gpu_input[i].channels, stream);
-            }
-            else if (params.filter_type == "brightness") {
-                launch_brightness_contrast_kernel((float*)gpu_input[i].data, (float*)gpu_output[i].data,
-                                                gpu_input[i].width, gpu_input[i].height, 
-                                                gpu_input[i].channels, 
-                                                static_cast<float>(params.brightness), 
-                                                params.contrast, stream);
-            }
-        }
-        
-        // Copy results back to CPU
-        for (int i = 0; i < current_batch_size; i++) {
-            const cv::Mat& original = images[batch_start + i];
-            cv::Mat result(original.rows, original.cols, CV_32FC(original.channels()));
-            
-            size_t img_size = result.total() * result.elemSize();
-            CUDA_CHECK(cudaMemcpyAsync(result.ptr<float>(), gpu_output[i].data, 
-                                     img_size, cudaMemcpyDeviceToHost, stream));
-            
-            // Convert back to 8-bit
-            cv::Mat final_result;
-            result.convertTo(final_result, CV_8U);
-            
-            processed_images.push_back(final_result);
-        }
-        
-        // Wait for all operations to complete
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        
-        // Free GPU memory for this batch
-        for (int i = 0; i < current_batch_size; i++) {
-            CUDA_CHECK(cudaFree(gpu_input[i].data));
-            CUDA_CHECK(cudaFree(gpu_output[i].data));
-        }
-        
-        delete[] gpu_input;
-        delete[] gpu_output;
+    if (timing) {
+        cudaEventElapsedTime(&timing->kernel_time, start, stop);
+        timing->total_time = timing->kernel_time;
     }
     
-    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaGetLastError());
     
-    return processed_images;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }
 
-// Utility functions
-float* create_gaussian_kernel(int size, float sigma) {
-    float* kernel = new float[size];
-    int half = size / 2;
+void launch_convolution_kernel(
+    unsigned char* d_input, 
+    unsigned char* d_output,
+    int width, 
+    int height, 
+    int channels,
+    float* d_kernel, 
+    int kernel_size,
+    TimingInfo* timing) {
+    
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    dim3 block_size(16, 16);
+    dim3 grid_size((width + block_size.x - 1) / block_size.x,
+                   (height + block_size.y - 1) / block_size.y);
+    
+    cudaEventRecord(start);
+    
+    convolution_kernel<<<grid_size, block_size>>>(
+        d_input, d_output, width, height, channels, d_kernel, kernel_size);
+    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    
+    if (timing) {
+        cudaEventElapsedTime(&timing->kernel_time, start, stop);
+        timing->total_time = timing->kernel_time;
+    }
+    
+    CUDA_CHECK(cudaGetLastError());
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
+
+void generate_gaussian_kernel(float* kernel, int size, float sigma) {
+    int half_size = size / 2;
     float sum = 0.0f;
     
-    for (int i = 0; i < size; i++) {
-        int x = i - half;
-        kernel[i] = expf(-(x * x) / (2.0f * sigma * sigma));
-        sum += kernel[i];
+    // Generate 2D Gaussian kernel
+    for (int y = -half_size; y <= half_size; y++) {
+        for (int x = -half_size; x <= half_size; x++) {
+            float value = expf(-(x*x + y*y) / (2.0f * sigma * sigma));
+            int idx = (y + half_size) * size + (x + half_size);
+            kernel[idx] = value;
+            sum += value;
+        }
     }
     
-    // Normalize
-    for (int i = 0; i < size; i++) {
+    // Normalize kernel
+    for (int i = 0; i < size * size; i++) {
         kernel[i] /= sum;
     }
-    
-    return kernel;
 }
 
-void print_performance_stats(double processing_time, int num_images, const std::string& filter_type) {
-    std::cout << "\n=== Performance Statistics ===" << std::endl;
-    std::cout << "Filter Type: " << filter_type << std::endl;
-    std::cout << "Total Images: " << num_images << std::endl;
-    std::cout << "Processing Time: " << processing_time << " seconds" << std::endl;
-    std::cout << "Throughput: " << (num_images / processing_time) << " images/second" << std::endl;
-    std::cout << "Average Time per Image: " << (processing_time / num_images * 1000.0) << " ms" << std::endl;
+void allocate_gpu_memory(unsigned char** d_ptr, size_t size) {
+    CUDA_CHECK(cudaMalloc(d_ptr, size));
+}
+
+void free_gpu_memory(unsigned char* d_ptr) {
+    if (d_ptr) {
+        CUDA_CHECK(cudaFree(d_ptr));
+    }
+}
+
+void copy_to_gpu(unsigned char* d_dst, unsigned char* h_src, size_t size) {
+    CUDA_CHECK(cudaMemcpy(d_dst, h_src, size, cudaMemcpyHostToDevice));
+}
+
+void copy_from_gpu(unsigned char* h_dst, unsigned char* d_src, size_t size) {
+    CUDA_CHECK(cudaMemcpy(h_dst, d_src, size, cudaMemcpyDeviceToHost));
+}
+
+} // extern "C"
+
+// CudaImageProcessor class implementation
+CudaImageProcessor::CudaImageProcessor() 
+    : d_input(nullptr), d_output(nullptr), d_kernel(nullptr),
+      width(0), height(0), channels(0), image_size(0), memory_allocated(false) {
+}
+
+CudaImageProcessor::~CudaImageProcessor() {
+    cleanup();
+}
+
+bool CudaImageProcessor::initialize(int w, int h, int c) {
+    width = w;
+    height = h;
+    channels = c;
+    image_size = width * height * channels * sizeof(unsigned char);
+    
+    try {
+        // Allocate GPU memory for input and output images
+        CUDA_CHECK(cudaMalloc(&d_input, image_size));
+        CUDA_CHECK(cudaMalloc(&d_output, image_size));
+        
+        // Allocate memory for kernels (max size assumption)
+        CUDA_CHECK(cudaMalloc(&d_kernel, 25 * 25 * sizeof(float))); // Max 25x25 kernel
+        
+        memory_allocated = true;
+        return true;
+    } catch (...) {
+        cleanup();
+        return false;
+    }
+}
+
+void CudaImageProcessor::cleanup() {
+    if (d_input) {
+        cudaFree(d_input);
+        d_input = nullptr;
+    }
+    if (d_output) {
+        cudaFree(d_output);
+        d_output = nullptr;
+    }
+    if (d_kernel) {
+        cudaFree(d_kernel);
+        d_kernel = nullptr;
+    }
+    memory_allocated = false;
+}
+
+bool CudaImageProcessor::process_gaussian_blur(const cv::Mat& input, cv::Mat& output, 
+                                              int kernel_size, float sigma,
+                                              TimingInfo* timing) {
+    if (!memory_allocated) return false;
+    
+    // Generate Gaussian kernel
+    std::vector<float> h_kernel(kernel_size * kernel_size);
+    generate_gaussian_kernel(h_kernel.data(), kernel_size, sigma);
+    
+    // Copy kernel to GPU
+    CUDA_CHECK(cudaMemcpy(d_kernel, h_kernel.data(), 
+                         kernel_size * kernel_size * sizeof(float), 
+                         cudaMemcpyHostToDevice));
+    
+    // Copy input image to GPU
+    CUDA_CHECK(cudaMemcpy(d_input, input.data, image_size, cudaMemcpyHostToDevice));
+    
+    // Launch kernel
+    launch_gaussian_blur_kernel(d_input, d_output, width, height, channels,
+                               d_kernel, kernel_size, sigma, timing);
+    
+    // Copy result back to host
+    output.create(height, width, input.type());
+    CUDA_CHECK(cudaMemcpy(output.data, d_output, image_size, cudaMemcpyDeviceToHost));
+    
+    return true;
+}
+
+bool CudaImageProcessor::process_sobel_edge(const cv::Mat& input, cv::Mat& output,
+                                           TimingInfo* timing) {
+    if (!memory_allocated) return false;
+    
+    // Copy input image to GPU
+    CUDA_CHECK(cudaMemcpy(d_input, input.data, image_size, cudaMemcpyHostToDevice));
+    
+    // Launch kernel
+    launch_sobel_edge_kernel(d_input, d_output, width, height, channels, timing);
+    
+    // Copy result back to host
+    output.create(height, width, input.type());
+    CUDA_CHECK(cudaMemcpy(output.data, d_output, image_size, cudaMemcpyDeviceToHost));
+    
+    return true;
+}
+
+bool CudaImageProcessor::process_emboss(const cv::Mat& input, cv::Mat& output,
+                                       TimingInfo* timing) {
+    if (!memory_allocated) return false;
+    
+    // Copy input image to GPU
+    CUDA_CHECK(cudaMemcpy(d_input, input.data, image_size, cudaMemcpyHostToDevice));
+    
+    // Launch kernel
+    launch_emboss_kernel(d_input, d_output, width, height, channels, timing);
+    
+    // Copy result back to host
+    output.create(height, width, input.type());
+    CUDA_CHECK(cudaMemcpy(output.data, d_output, image_size, cudaMemcpyDeviceToHost));
+    
+    return true;
+}
+
+bool CudaImageProcessor::process_custom_convolution(const cv::Mat& input, cv::Mat& output,
+                                                   const std::vector<float>& kernel,
+                                                   int kernel_size,
+                                                   TimingInfo* timing) {
+    if (!memory_allocated) return false;
+    
+    // Copy kernel to GPU
+    CUDA_CHECK(cudaMemcpy(d_kernel, kernel.data(), 
+                         kernel.size() * sizeof(float), 
+                         cudaMemcpyHostToDevice));
+    
+    // Copy input image to GPU
+    CUDA_CHECK(cudaMemcpy(d_input, input.data, image_size, cudaMemcpyHostToDevice));
+    
+    // Launch kernel
+    launch_convolution_kernel(d_input, d_output, width, height, channels,
+                             d_kernel, kernel_size, timing);
+    
+    // Copy result back to host
+    output.create(height, width, input.type());
+    CUDA_CHECK(cudaMemcpy(output.data, d_output, image_size, cudaMemcpyDeviceToHost));
+    
+    return true;
+}
+
+void CudaImageProcessor::print_device_info() {
+    int device;
+    cudaGetDevice(&device);
+    
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    
+    std::cout << "GPU Device Information:" << std::endl;
+    std::cout << "  Name: " << prop.name << std::endl;
+    std::cout << "  Compute Capability: " << prop.major << "." << prop.minor << std::endl;
+    std::cout << "  Total Global Memory: " << prop.totalGlobalMem / (1024 * 1024) << " MB" << std::endl;
+    std::cout << "  Multiprocessors: " << prop.multiProcessorCount << std::endl;
+    std::cout << "  Max Threads per Block: " << prop.maxThreadsPerBlock << std::endl;
+    std::cout << "  Memory Clock Rate: " << prop.memoryClockRate / 1000 << " MHz" << std::endl;
+    std::cout << "  Memory Bus Width: " << prop.memoryBusWidth << " bits" << std::endl;
+}
+
+size_t CudaImageProcessor::get_memory_usage() const {
+    return image_size * 2 + 25 * 25 * sizeof(float); // Input + Output + Max kernel
 }
